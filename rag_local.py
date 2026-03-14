@@ -182,17 +182,15 @@ def ollama_generate(prompt: str, system: str = "") -> str:
     return response.json()["response"]
 
 
-def check_ollama():
-    """Vérifie qu'Ollama est accessible."""
+def check_ollama() -> list[str]:
+    """Vérifie qu'Ollama est accessible. Retourne la liste des modèles ou lève une exception."""
     try:
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         r.raise_for_status()
         models = [m["name"] for m in r.json().get("models", [])]
         return models
     except requests.ConnectionError:
-        print("ERREUR : Ollama n'est pas lancé.")
-        print("  → Lance Ollama avec : ollama serve")
-        sys.exit(1)
+        raise ConnectionError("Ollama n'est pas lancé. Lance Ollama avec : ollama serve")
 
 
 # ─────────────────────────────────────────────
@@ -211,8 +209,8 @@ def get_collection() -> chromadb.Collection:
 
 
 def file_hash(filepath: str) -> str:
-    """Hash MD5 d'un fichier pour détecter les doublons."""
-    h = hashlib.md5()
+    """Hash SHA-256 d'un fichier pour détecter les doublons."""
+    h = hashlib.sha256()
     with open(filepath, "rb") as f:
         for block in iter(lambda: f.read(8192), b""):
             h.update(block)
@@ -231,7 +229,11 @@ def cmd_index(folder: str):
         sys.exit(1)
 
     # Vérifier Ollama et le modèle d'embedding
-    models = check_ollama()
+    try:
+        models = check_ollama()
+    except ConnectionError as e:
+        print(f"ERREUR : {e}")
+        sys.exit(1)
     if not any(EMBEDDING_MODEL in m for m in models):
         print(f"Le modèle {EMBEDDING_MODEL} n'est pas installé.")
         print(f"  → Installe-le avec : ollama pull {EMBEDDING_MODEL}")
@@ -312,7 +314,11 @@ def cmd_index(folder: str):
 
 def cmd_search(query: str, top_k: int = TOP_K):
     """Recherche sémantique sans LLM — retourne les passages pertinents."""
-    check_ollama()
+    try:
+        check_ollama()
+    except ConnectionError as e:
+        print(f"ERREUR : {e}")
+        sys.exit(1)
     collection = get_collection()
 
     if collection.count() == 0:
@@ -355,7 +361,11 @@ def cmd_search(query: str, top_k: int = TOP_K):
 
 def cmd_ask(question: str, top_k: int = TOP_K):
     """RAG complet : recherche sémantique + génération de réponse par le LLM."""
-    models = check_ollama()
+    try:
+        models = check_ollama()
+    except ConnectionError as e:
+        print(f"ERREUR : {e}")
+        sys.exit(1)
     if not any(LLM_MODEL in m for m in models):
         print(f"Le modèle {LLM_MODEL} n'est pas installé.")
         print(f"  → Installe-le avec : ollama pull {LLM_MODEL}")
@@ -447,7 +457,7 @@ def cmd_status():
         for m in models:
             marker = "📌" if EMBEDDING_MODEL in m or LLM_MODEL in m else "  "
             print(f"   {marker} {m}")
-    except SystemExit:
+    except ConnectionError:
         print("❌ Ollama n'est pas accessible")
 
     # Vérifier la base

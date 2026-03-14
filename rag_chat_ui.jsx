@@ -859,7 +859,9 @@ export default function RAGChat() {
 
   const checkStatus = async () => {
     try {
-      const data = await apiCall("/status");
+      const res = await fetch(`${API_BASE}/status`);
+      if (!res.ok) throw new Error(`Erreur serveur : ${res.status}`);
+      const data = await res.json();
       setStatus(data);
     } catch {
       // Backend non connecté — mode démo

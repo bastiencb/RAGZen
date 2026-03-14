@@ -76,6 +76,7 @@ CHUNK_SIZES = {
     "text": 800,        # Texte brut — fallback
 }
 CHUNK_OVERLAP = 200
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 Mo max par fichier
 
 # Extensions supportées, classées par catégorie
 EXT_CATEGORIES = {
@@ -125,7 +126,7 @@ EXT_CATEGORIES = {
     ".ini": "text",
     ".cfg": "text",
     ".conf": "text",
-    ".env": "text",
+    # ".env" volontairement exclu : risque d'indexer des secrets
 }
 
 SUPPORTED_EXTENSIONS = set(EXT_CATEGORIES.keys())
@@ -138,8 +139,8 @@ app = FastAPI(title="RAG Local API v2", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -192,21 +193,6 @@ def extract_text_file(filepath: str) -> str:
 # Découpage intelligent avec LangChain
 # ─────────────────────────────────────────────
 
-def build_context_prefix(elements: list[dict], current_index: int) -> str:
-    """
-    Construit le préfixe de contexte hiérarchique pour un élément.
-    Ex: "Chapitre 3 : Conditions > Article 7 : Résiliation"
-    """
-    titles = []
-    for i in range(current_index):
-        if elements[i]["type"] == "Title":
-            titles.append(elements[i]["text"].strip())
-    # Garder les 3 derniers niveaux de titre max
-    if titles:
-        return " > ".join(titles[-3:])
-    return ""
-
-
 def chunk_structured_document(elements: list[dict], filepath: str) -> list[dict]:
     """
     Découpe un document structuré (issu d'Unstructured) en chunks intelligents.
@@ -224,9 +210,11 @@ def chunk_structured_document(elements: list[dict], filepath: str) -> list[dict]
 
     chunks = []
     current_section_text = ""
+    # Maintenir les titres de manière incrémentale (O(n) au lieu de O(n²))
+    titles_seen = []
     current_context = ""
 
-    for i, el in enumerate(elements):
+    for el in elements:
         if el["type"] == "Title":
             # Flush la section en cours
             if current_section_text.strip():
@@ -239,8 +227,9 @@ def chunk_structured_document(elements: list[dict], filepath: str) -> list[dict]
                         "source": os.path.basename(filepath),
                     })
 
-            # Nouveau titre → nouveau contexte
-            current_context = build_context_prefix(elements, i + 1)
+            # Nouveau titre → mettre à jour le contexte incrémentalement
+            titles_seen.append(el["text"].strip())
+            current_context = " > ".join(titles_seen[-3:])
             current_section_text = ""
         else:
             current_section_text += el["text"] + "\n\n"
@@ -612,9 +601,19 @@ def check_ollama() -> dict:
 # ChromaDB
 # ─────────────────────────────────────────────
 
+_chroma_client = None
+
+
+def _get_chroma_client():
+    global _chroma_client
+    if _chroma_client is None:
+        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    return _chroma_client
+
+
 def get_collection():
-    os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    client = _get_chroma_client()
     return client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
@@ -622,7 +621,7 @@ def get_collection():
 
 
 def file_hash(filepath: str) -> str:
-    h = hashlib.md5()
+    h = hashlib.sha256()
     with open(filepath, "rb") as f:
         for block in iter(lambda: f.read(8192), b""):
             h.update(block)
@@ -648,12 +647,15 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
 
+    def validated_top_k(self) -> int:
+        return max(1, min(self.top_k, 20))
+
 
 # ─────────────────────────────────────────────
 # Routes API
 # ─────────────────────────────────────────────
 
-@app.post("/status")
+@app.get("/status")
 def api_status():
     ollama = check_ollama()
     collection = get_collection()
@@ -699,11 +701,23 @@ def api_index(req: IndexRequest):
         filename = os.path.relpath(filepath, folder)
         fhash = file_hash(filepath)
 
-        # Skip si déjà indexé
+        # Vérifier la taille du fichier
+        file_size = os.path.getsize(filepath)
+        if file_size > MAX_FILE_SIZE:
+            logger.warning(f"  ⏭  {filename} (trop volumineux : {file_size / 1024 / 1024:.0f} Mo)")
+            continue
+
+        # Skip si déjà indexé (même hash)
         existing = collection.get(where={"file_hash": fhash})
         if existing and existing["ids"]:
             logger.info(f"  ⏭  {filename} (déjà indexé)")
             continue
+
+        # Supprimer les anciens chunks du même fichier source (fichier modifié)
+        old_chunks = collection.get(where={"source": filename})
+        if old_chunks and old_chunks["ids"]:
+            collection.delete(ids=old_chunks["ids"])
+            logger.info(f"  🔄 {filename} : {len(old_chunks['ids'])} anciens chunks supprimés")
 
         try:
             # ── Pipeline v2 : extraction + chunking intelligent ──
@@ -772,7 +786,7 @@ def api_search(req: QueryRequest):
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=req.top_k,
+        n_results=req.validated_top_k(),
         include=["documents", "metadatas", "distances"],
     )
 
@@ -806,7 +820,7 @@ def api_ask(req: QueryRequest):
     query_embedding = ollama_embed([req.query])[0]
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=req.top_k,
+        n_results=req.validated_top_k(),
         include=["documents", "metadatas", "distances"],
     )
 
@@ -865,7 +879,9 @@ Réponse :"""
 
 @app.post("/reset")
 def api_reset():
+    global _chroma_client
     if os.path.exists(CHROMA_PERSIST_DIR):
+        _chroma_client = None
         shutil.rmtree(CHROMA_PERSIST_DIR)
     return {"status": "ok", "message": "Base vectorielle supprimée"}
 
