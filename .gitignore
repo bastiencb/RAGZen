@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ChromaDB (base vectorielle locale)
+.ragzen/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Node (si frontend React buildé localement)
+node_modules/
+package-lock.json
+yarn.lock
