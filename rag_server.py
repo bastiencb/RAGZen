@@ -61,8 +61,8 @@ logger = logging.getLogger("rag-local")
 # ─────────────────────────────────────────────
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-EMBEDDING_MODEL = "bge-m3"
-LLM_MODEL = "mistral-nemo"
+EMBEDDING_MODEL = os.environ.get("RAGZEN_EMBED_MODEL", "nomic-embed-text")
+LLM_MODEL = os.environ.get("RAGZEN_LLM_MODEL", "phi3:mini")
 
 CHROMA_PERSIST_DIR = os.path.expanduser("~/.rag_local/chroma_db")
 COLLECTION_NAME = "mes_documents"
@@ -565,27 +565,67 @@ def process_file(filepath: str) -> list[dict]:
 # ─────────────────────────────────────────────
 
 def ollama_embed(texts: list[str]) -> list[list[float]]:
-    r = requests.post(
-        f"{OLLAMA_BASE_URL}/api/embed",
-        json={"model": EMBEDDING_MODEL, "input": texts},
-        timeout=120,
-    )
-    r.raise_for_status()
+    import time as _time
+    t0 = _time.time()
+    try:
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": EMBEDDING_MODEL, "input": texts, "keep_alive": "30m"},
+            timeout=300,
+        )
+        r.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(503, "Ollama n'est pas accessible. Lance 'ollama serve'.")
+    except requests.exceptions.Timeout:
+        raise HTTPException(504, "Timeout lors de l'embedding. Ollama est peut-etre surcharge.")
+    except requests.exceptions.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.response.json().get("error", "")
+        except Exception:
+            error_body = e.response.text[:500]
+        raise HTTPException(502, f"Erreur Ollama embedding : {error_body}")
+    t1 = _time.time()
+    logger.info(f"[embed] {len(texts)} text(s), {t1 - t0:.2f}s")
     return r.json()["embeddings"]
 
 
-def ollama_generate(prompt: str, system: str = "") -> str:
+def ollama_generate(prompt: str, system: str = "", model: str = "") -> str:
+    use_model = model or LLM_MODEL
     payload = {
-        "model": LLM_MODEL,
+        "model": use_model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.3, "num_predict": 1024},
+        "keep_alive": "30m",
+        "options": {"temperature": 0.3, "num_predict": 512, "num_ctx": 2048},
     }
     if system:
         payload["system"] = system
-    r = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=300)
-    r.raise_for_status()
-    return r.json()["response"]
+    try:
+        r = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=300)
+        r.raise_for_status()
+        return r.json()["response"]
+    except requests.exceptions.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.response.json().get("error", "")
+        except Exception:
+            error_body = e.response.text[:500]
+        if "unable to allocate" in error_body or "out of memory" in error_body.lower():
+            raise HTTPException(
+                503,
+                f"Memoire insuffisante pour charger le modele '{use_model}'. "
+                f"Essaie un modele plus leger (ex: mistral:7b) ou libere de la RAM. "
+                f"Detail Ollama : {error_body}"
+            )
+        raise HTTPException(
+            502,
+            f"Erreur Ollama lors de la generation avec '{use_model}' : {error_body}"
+        )
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(503, "Ollama n'est pas accessible. Lance 'ollama serve'.")
+    except requests.exceptions.Timeout:
+        raise HTTPException(504, f"Timeout : le modele '{use_model}' met trop de temps a repondre.")
 
 
 def check_ollama() -> dict:
@@ -646,10 +686,16 @@ class IndexRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = 2
 
     def validated_top_k(self) -> int:
         return max(1, min(self.top_k, 20))
+
+class ModelPullRequest(BaseModel):
+    name: str
+
+class ModelSelectRequest(BaseModel):
+    name: str
 
 
 # ─────────────────────────────────────────────
@@ -670,6 +716,8 @@ def api_status():
     return {
         "ollama": ollama["online"],
         "models": ollama["models"],
+        "activeModel": LLM_MODEL,
+        "embeddingModel": EMBEDDING_MODEL,
         "dbCount": collection.count(),
         "sources": get_indexed_sources(),
     }
@@ -816,21 +864,25 @@ def api_search(req: QueryRequest):
 
 @app.post("/ask")
 def api_ask(req: QueryRequest):
+    import time as _time
+    t0 = _time.time()
+
     collection = get_collection()
     if collection.count() == 0:
         raise HTTPException(400, "Base vide — indexe d'abord des documents")
 
-    ollama = check_ollama()
-    if not any(LLM_MODEL in m for m in ollama["models"]):
-        raise HTTPException(503, f"Modèle {LLM_MODEL} non installé dans Ollama")
-
-    # Recherche sémantique
+    # Recherche sémantique (skip check_ollama pour la perf, les erreurs sont gerees dans ollama_embed/generate)
     query_embedding = ollama_embed([req.query])[0]
+    t1 = _time.time()
+    logger.info(f"[ask] embedding: {t1 - t0:.2f}s")
+
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=req.validated_top_k(),
         include=["documents", "metadatas", "distances"],
     )
+    t2 = _time.time()
+    logger.info(f"[ask] chromadb query: {t2 - t1:.2f}s")
 
     # Construire le contexte enrichi avec les infos de section
     context_parts = []
@@ -858,6 +910,12 @@ def api_ask(req: QueryRequest):
             seen_sources.add(source_name)
 
     context_str = "\n\n---\n\n".join(context_parts)
+    # Tronquer le contexte pour eviter des prompts trop longs (lent en CPU)
+    MAX_CONTEXT_CHARS = 1500
+    if len(context_str) > MAX_CONTEXT_CHARS:
+        context_str = context_str[:MAX_CONTEXT_CHARS] + "\n[... tronque pour performance ...]"
+
+    logger.info(f"[ask] context size: {len(context_str)} chars")
 
     system_prompt = """Tu es un assistant qui répond aux questions en te basant UNIQUEMENT sur les extraits de documents fournis.
 Règles :
@@ -877,7 +935,12 @@ Question : {req.query}
 
 Réponse :"""
 
+    logger.info(f"[ask] prompt total: {len(system_prompt) + len(user_prompt)} chars, model: {LLM_MODEL}")
+    t3 = _time.time()
     answer = ollama_generate(user_prompt, system=system_prompt)
+    t4 = _time.time()
+    logger.info(f"[ask] LLM generate: {t4 - t3:.2f}s")
+    logger.info(f"[ask] TOTAL: {t4 - t0:.2f}s")
 
     return {
         "answer": answer,
@@ -888,10 +951,99 @@ Réponse :"""
 @app.post("/reset")
 def api_reset():
     global _chroma_client
-    if os.path.exists(CHROMA_PERSIST_DIR):
-        _chroma_client = None
-        shutil.rmtree(CHROMA_PERSIST_DIR)
-    return {"status": "ok", "message": "Base vectorielle supprimée"}
+    try:
+        client = _get_chroma_client()
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    _chroma_client = None
+    try:
+        if os.path.exists(CHROMA_PERSIST_DIR):
+            shutil.rmtree(CHROMA_PERSIST_DIR)
+    except Exception:
+        pass
+    return {"status": "ok", "message": "Base vectorielle supprimee"}
+
+
+@app.get("/models")
+def api_models():
+    """Liste les modeles Ollama disponibles et indique le modele actif."""
+    ollama = check_ollama()
+    if not ollama["online"]:
+        raise HTTPException(503, "Ollama n'est pas accessible")
+    return {
+        "models": ollama["models"],
+        "activeModel": LLM_MODEL,
+        "embeddingModel": EMBEDDING_MODEL,
+    }
+
+
+@app.post("/models/pull")
+def api_models_pull(req: ModelPullRequest):
+    """Telecharge un modele Ollama."""
+    ollama = check_ollama()
+    if not ollama["online"]:
+        raise HTTPException(503, "Ollama n'est pas accessible")
+    try:
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/pull",
+            json={"name": req.name, "stream": False},
+            timeout=600,
+        )
+        r.raise_for_status()
+        return {"status": "ok", "message": f"Modele '{req.name}' telecharge avec succes"}
+    except requests.exceptions.Timeout:
+        raise HTTPException(504, f"Timeout lors du telechargement de '{req.name}'")
+    except requests.exceptions.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.response.json().get("error", "")
+        except Exception:
+            error_body = e.response.text[:500]
+        raise HTTPException(502, f"Erreur Ollama : {error_body}")
+
+
+@app.post("/models/select")
+def api_models_select(req: ModelSelectRequest):
+    """Change le modele LLM actif."""
+    global LLM_MODEL
+    ollama = check_ollama()
+    if not ollama["online"]:
+        raise HTTPException(503, "Ollama n'est pas accessible")
+    # Verifier que le modele existe dans Ollama
+    if not any(req.name in m for m in ollama["models"]):
+        raise HTTPException(
+            404,
+            f"Modele '{req.name}' non trouve dans Ollama. "
+            f"Modeles disponibles : {', '.join(ollama['models'])}. "
+            f"Telecharge-le d'abord via /models/pull."
+        )
+    LLM_MODEL = req.name
+    logger.info(f"Modele LLM change pour : {LLM_MODEL}")
+    return {"status": "ok", "activeModel": LLM_MODEL}
+
+
+@app.delete("/models/{model_name}")
+def api_models_delete(model_name: str):
+    """Supprime un modele Ollama."""
+    ollama = check_ollama()
+    if not ollama["online"]:
+        raise HTTPException(503, "Ollama n'est pas accessible")
+    try:
+        r = requests.delete(
+            f"{OLLAMA_BASE_URL}/api/delete",
+            json={"name": model_name},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return {"status": "ok", "message": f"Modele '{model_name}' supprime"}
+    except requests.exceptions.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.response.json().get("error", "")
+        except Exception:
+            error_body = e.response.text[:500]
+        raise HTTPException(502, f"Erreur Ollama : {error_body}")
 
 
 # ─────────────────────────────────────────────
@@ -907,16 +1059,36 @@ if __name__ == "__main__":
 
     ollama = check_ollama()
     if ollama["online"]:
-        print(f"  ✅ Ollama connecté ({len(ollama['models'])} modèle(s))")
-        for m in ollama["models"]:
-            marker = "📌" if EMBEDDING_MODEL in m or LLM_MODEL in m else "  "
-            print(f"     {marker} {m}")
+        logger.info(f"Ollama connecte ({len(ollama['models'])} modele(s))")
+        # Prechauffe des modeles necessaires
+        logger.info(f"Prechauffe {EMBEDDING_MODEL}...")
+        try:
+            requests.post(
+                f"{OLLAMA_BASE_URL}/api/embed",
+                json={"model": EMBEDDING_MODEL, "input": "warmup", "keep_alive": "30m"},
+                timeout=300,
+            )
+            logger.info(f"  {EMBEDDING_MODEL} pret")
+        except Exception as e:
+            logger.warning(f"  Echec prechauffe {EMBEDDING_MODEL}: {e}")
+        logger.info(f"Prechauffe {LLM_MODEL}...")
+        try:
+            requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={"model": LLM_MODEL, "prompt": "warmup", "stream": False,
+                      "keep_alive": "30m", "options": {"num_predict": 1}},
+                timeout=300,
+            )
+            logger.info(f"  {LLM_MODEL} pret")
+        except Exception as e:
+            logger.warning(f"  Echec prechauffe {LLM_MODEL}: {e}")
     else:
-        print("  ⚠️  Ollama non détecté — lance 'ollama serve'")
+        logger.warning("Ollama non detecte - lance 'ollama serve'")
 
     collection = get_collection()
-    print(f"  📦 ChromaDB : {collection.count()} chunks en base")
-    print(f"  📂 Extensions supportées : {len(SUPPORTED_EXTENSIONS)}")
-    print()
+    logger.info(f"ChromaDB : {collection.count()} chunks en base")
+    logger.info(f"Modeles : embedding={EMBEDDING_MODEL}, llm={LLM_MODEL}")
+    logger.info(f"Extensions supportees : {len(SUPPORTED_EXTENSIONS)}")
+    logger.info("Serveur pret sur http://localhost:8765")
 
     uvicorn.run(app, host="0.0.0.0", port=8765)

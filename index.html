@@ -454,6 +454,38 @@
     .settings-input { width: 60px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; color: var(--text-primary); font-family: 'JetBrains Mono', monospace; font-size: 12px; text-align: center; outline: none; }
     .settings-input:focus { border-color: var(--border-focus); }
 
+    .settings-select {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 8px;
+      color: var(--text-primary);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      outline: none;
+      cursor: pointer;
+      max-width: 140px;
+    }
+    .settings-select:focus { border-color: var(--border-focus); }
+    .settings-select option { background: var(--bg-card); color: var(--text-primary); }
+
+    .pull-model-row { display: flex; gap: 6px; align-items: center; padding: 8px 0; }
+    .pull-model-input {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 8px;
+      color: var(--text-primary);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      outline: none;
+    }
+    .pull-model-input:focus { border-color: var(--border-focus); }
+    .pull-model-input::placeholder { color: var(--text-muted); }
+    .btn-sm { padding: 4px 10px; font-size: 11px; }
+    .pulling-text { font-size: 11px; color: var(--warning); font-family: 'JetBrains Mono', monospace; animation: pulse-dot 1.5s infinite; }
+
     /* Notification */
     .notification { position: fixed; top: 16px; right: 16px; padding: 12px 20px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; z-index: 100; animation: notif-in 0.3s ease; box-shadow: var(--shadow); }
     .notification.success { background: #1a2e1a; border: 1px solid rgba(64, 192, 87, 0.3); color: var(--success); }
@@ -521,6 +553,8 @@
       const [topK, setTopK] = useState(5);
       const [notification, setNotification] = useState(null);
       const [showSettings, setShowSettings] = useState(false);
+      const [pullModelName, setPullModelName] = useState("");
+      const [isPulling, setIsPulling] = useState(false);
       const messagesEndRef = useRef(null);
       const textareaRef = useRef(null);
 
@@ -535,7 +569,14 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(data),
         });
-        if (!res.ok) throw new Error(`Erreur serveur : ${res.status}`);
+        if (!res.ok) {
+          let detail = `Erreur serveur : ${res.status}`;
+          try {
+            const err = await res.json();
+            if (err.detail) detail = err.detail;
+          } catch {}
+          throw new Error(detail);
+        }
         return res.json();
       };
 
@@ -547,6 +588,33 @@
           setStatus(data);
         } catch {
           setStatus({ ollama: false, models: [], dbCount: 0, sources: [] });
+        }
+      };
+
+      const handleSelectModel = async (modelName) => {
+        try {
+          await apiCall("/models/select", { name: modelName });
+          notify(`Modele actif : ${modelName}`, "success");
+          checkStatus();
+        } catch (e) {
+          notify(`Erreur : ${e.message}`, "error");
+        }
+      };
+
+      const handlePullModel = async () => {
+        const name = pullModelName.trim();
+        if (!name) return;
+        setIsPulling(true);
+        notify(`Telechargement de '${name}' en cours...`, "info");
+        try {
+          await apiCall("/models/pull", { name });
+          notify(`Modele '${name}' telecharge !`, "success");
+          setPullModelName("");
+          checkStatus();
+        } catch (e) {
+          notify(`Echec du telechargement : ${e.message}`, "error");
+        } finally {
+          setIsPulling(false);
         }
       };
 
@@ -748,12 +816,34 @@
                   </div>
                   <div className="settings-row">
                     <span className="settings-label">Embedding</span>
-                    <span className="settings-value">bge-m3</span>
+                    <span className="settings-value">{status.embeddingModel || "bge-m3"}</span>
                   </div>
                   <div className="settings-row">
-                    <span className="settings-label">LLM</span>
-                    <span className="settings-value">mistral-nemo</span>
+                    <span className="settings-label">LLM actif</span>
+                    <select className="settings-select"
+                      value={status.activeModel || ""}
+                      onChange={(e) => handleSelectModel(e.target.value)}>
+                      {status.models?.filter(m => !m.includes("bge-")).map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
                   </div>
+                  <div className="pull-model-row">
+                    <input className="pull-model-input"
+                      type="text"
+                      value={pullModelName}
+                      onChange={(e) => setPullModelName(e.target.value)}
+                      placeholder="mistral, llama3, phi3..."
+                      disabled={isPulling}
+                      onKeyDown={(e) => e.key === "Enter" && handlePullModel()}
+                    />
+                    <button className="btn btn-primary btn-sm"
+                      onClick={handlePullModel}
+                      disabled={isPulling || !pullModelName.trim()}>
+                      {isPulling ? "..." : "Pull"}
+                    </button>
+                  </div>
+                  {isPulling && <div className="pulling-text">Telechargement en cours...</div>}
                 </div>
               )}
             </div>
@@ -779,7 +869,7 @@
             <div className="chat-header">
               <div className="chat-header-left">
                 <h2>Chat</h2>
-                <span className="model-badge">mistral-nemo:12b</span>
+                <span className="model-badge">{status.activeModel || "mistral"}</span>
               </div>
               <div className="mode-toggle">
                 <button className={mode === "ask" ? "active" : ""}
