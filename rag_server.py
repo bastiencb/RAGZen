@@ -46,6 +46,7 @@ import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ─────────────────────────────────────────────
@@ -654,6 +655,13 @@ class QueryRequest(BaseModel):
 # ─────────────────────────────────────────────
 # Routes API
 # ─────────────────────────────────────────────
+
+@app.get("/")
+def serve_ui():
+    html_path = Path(__file__).parent / "index.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="index.html not found")
+    return FileResponse(html_path, media_type="text/html")
 
 @app.get("/status")
 def api_status():

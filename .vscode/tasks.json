@@ -1,0 +1,125 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "folderPath",
+      "description": "Chemin du dossier a indexer",
+      "type": "promptString",
+      "default": "D:\\ProjetsVSCODE\\RAGZen-1\\docs"
+    },
+    {
+      "id": "query",
+      "description": "Question ou recherche",
+      "type": "promptString",
+      "default": "Qu'est-ce que RAGZen ?"
+    },
+    {
+      "id": "topK",
+      "description": "Nombre de resultats (top_k, 1-20)",
+      "type": "promptString",
+      "default": "5"
+    },
+    {
+      "id": "serverPort",
+      "description": "Port du serveur",
+      "type": "promptString",
+      "default": "8765"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "RAGZen: Demarrer le serveur",
+      "type": "shell",
+      "command": "set PYTHONIOENCODING=utf-8 && set OLLAMA_MODELS=E:\\ollama\\models && python rag_server.py",
+      "group": "build",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "ragzen"
+      }
+    },
+    {
+      "label": "RAGZen: Demarrer Ollama",
+      "type": "shell",
+      "command": "set OLLAMA_MODELS=E:\\ollama\\models && \"%LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe\" serve",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "ragzen"
+      }
+    },
+    {
+      "label": "RAGZen: Demarrer tout (Ollama + Serveur)",
+      "dependsOn": [
+        "RAGZen: Demarrer Ollama",
+        "RAGZen: Demarrer le serveur"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "RAGZen: Verifier le statut",
+      "type": "shell",
+      "command": "curl -s http://localhost:${input:serverPort}/status | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "RAGZen: Indexer un dossier",
+      "type": "shell",
+      "command": "curl -s -X POST http://localhost:${input:serverPort}/index -H \"Content-Type: application/json\" -d \"{\\\"folder\\\": \\\"${input:folderPath}\\\"}\" | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "RAGZen: Recherche semantique",
+      "type": "shell",
+      "command": "curl -s -X POST http://localhost:${input:serverPort}/search -H \"Content-Type: application/json\" -d \"{\\\"query\\\": \\\"${input:query}\\\", \\\"top_k\\\": ${input:topK}}\" | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "RAGZen: Poser une question (RAG)",
+      "type": "shell",
+      "command": "curl -s -X POST http://localhost:${input:serverPort}/ask -H \"Content-Type: application/json\" -d \"{\\\"query\\\": \\\"${input:query}\\\", \\\"top_k\\\": ${input:topK}}\" | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "RAGZen: Reinitialiser la base",
+      "type": "shell",
+      "command": "curl -s -X POST http://localhost:${input:serverPort}/reset -H \"Content-Type: application/json\" | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "RAGZen: Lister les modeles Ollama",
+      "type": "shell",
+      "command": "curl -s http://localhost:11434/api/tags | python -m json.tool",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}
